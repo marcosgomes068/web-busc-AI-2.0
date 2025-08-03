@@ -1,7 +1,26 @@
+import { CohereClient } from 'cohere-ai';
+import { CONFIG } from '../config.js';
+import logger from '../utils/logger.js';
+
+const CONTENT_QUALITY_THRESHOLD = 0.3;
+const MIN_SUMMARY_LENGTH = 50;
+const MAX_COHERE_PROMPT_LENGTH = 2000;
+const INSUFFICIENT_DATA_KEYWORDS = [
+  'informações insuficientes',
+  'dados limitados',
+  'conteúdo genérico',
+  'informações básicas',
+  'não encontrado',
+  'sem detalhes específicos'
+];
+
 class AIService {
   constructor() {
     this.flaskServiceUrl = 'http://localhost:5000';
     this.serviceAvailable = false;
+    this.cohereClient = CONFIG.api.cohere ? new CohereClient({
+      token: CONFIG.api.cohere
+    }) : null;
   }
 
   async analyzeQuery(query) {
@@ -17,7 +36,21 @@ class AIService {
   }
 
   async synthesizeResponse(summaries, originalQuery) {
-    return this.fallbackResponse(summaries, originalQuery);
+    const initialResponse = this.fallbackResponse(summaries, originalQuery);
+    
+    // Verificar se a resposta é adequada ou se precisa do fallback da Cohere
+    const needsCohereEnhancement = await this.shouldUseCohereEnhancement(
+      initialResponse, 
+      originalQuery, 
+      summaries
+    );
+    
+    if (needsCohereEnhancement && this.cohereClient) {
+      logger.info('Using Cohere enhancement for insufficient data response');
+      return await this.enhanceResponseWithCohere(initialResponse, originalQuery, summaries);
+    }
+    
+    return initialResponse;
   }
 
   async analyzeSourceQuality(url, content) {
@@ -100,8 +133,8 @@ class AIService {
     // Verificar se temos snippets de busca
     const hasSnippets = limitedSummaries.some(s => s.isSnippet);
     
-    // Gerar resposta no estilo ChatGPT
-    const response = this.generateChatGPTStyleResponse(limitedQuery, combinedContent, limitedSummaries, hasSnippets);
+    // Gerar resposta inteligente com análise de contexto
+    const response = this.generateIntelligentResponse(limitedQuery, combinedContent, limitedSummaries, hasSnippets);
     
     // Criar seções estruturadas
     const sections = this.createStructuredSections(limitedSummaries, combinedContent, hasSnippets);
@@ -121,7 +154,7 @@ class AIService {
     };
   }
 
-  generateChatGPTStyleResponse(query, content, summaries, hasSnippets) {
+  generateIntelligentResponse(query, content, summaries, hasSnippets) {
     // Analisar o tipo de pergunta
     const questionType = this.analyzeQuestionType(query);
     
@@ -594,6 +627,140 @@ class AIService {
     return 'Esta síntese combina informações de múltiplas fontes para fornecer uma visão completa e atualizada.';
   }
 
+  /**
+   * Determines if Cohere enhancement is needed based on response quality
+   */
+  async shouldUseCohereEnhancement(response, originalQuery, summaries) {
+    // Check if response contains insufficient data indicators
+    const hasInsufficientDataKeywords = INSUFFICIENT_DATA_KEYWORDS.some(keyword =>
+      response.response.toLowerCase().includes(keyword)
+    );
+    
+    // Check response length and quality
+    const isResponseTooShort = response.response.length < MIN_SUMMARY_LENGTH;
+    
+    // Check if summaries contain meaningful content
+    const hasLowQualitySummaries = summaries.length === 0 || 
+      summaries.every(s => !s.summary || s.summary.length < MIN_SUMMARY_LENGTH);
+    
+    // Check confidence score
+    const hasLowConfidence = response.confidence < CONTENT_QUALITY_THRESHOLD;
+    
+    return hasInsufficientDataKeywords || isResponseTooShort || hasLowQualitySummaries || hasLowConfidence;
+  }
+
+  /**
+   * Enhances response using Cohere AI when collected data is insufficient
+   */
+  async enhanceResponseWithCohere(originalResponse, query, summaries) {
+    try {
+      const cohereResponse = await this.generateCohereKnowledgeResponse(query);
+      
+      if (cohereResponse && cohereResponse.length > MIN_SUMMARY_LENGTH) {
+        const enhancedResponse = this.combineOriginalAndCohereResponses(
+          originalResponse, 
+          cohereResponse, 
+          query
+        );
+        
+        return enhancedResponse;
+      }
+      
+      return originalResponse;
+    } catch (error) {
+      logger.error('Cohere enhancement failed:', error);
+      return originalResponse;
+    }
+  }
+
+  /**
+   * Generates knowledge-based response using Cohere
+   */
+  async generateCohereKnowledgeResponse(query) {
+    const prompt = this.createCoherePrompt(query);
+    
+    const response = await this.cohereClient.generate({
+      model: 'command-xlarge-nightly',
+      prompt: prompt,
+      max_tokens: 500,
+      temperature: 0.3,
+      k: 0,
+      stop_sequences: [],
+      return_likelihoods: 'NONE'
+    });
+    
+    return response.generations[0]?.text?.trim() || '';
+  }
+
+  /**
+   * Creates an appropriate prompt for Cohere based on the query
+   */
+  createCoherePrompt(query) {
+    const truncatedQuery = query.length > MAX_COHERE_PROMPT_LENGTH ? 
+      query.substring(0, MAX_COHERE_PROMPT_LENGTH) : query;
+    
+    return `Como um assistente de IA especializado, forneça informações detalhadas e precisas sobre: "${truncatedQuery}"
+
+Inclua:
+- Conceitos principais e definições
+- Dados técnicos relevantes
+- Informações históricas importantes
+- Exemplos específicos quando aplicável
+- Números, estatísticas ou medições relevantes
+
+Responda de forma estruturada e informativa em português:`;
+  }
+
+  /**
+   * Combines original web-scraped response with Cohere knowledge
+   */
+  combineOriginalAndCohereResponses(originalResponse, cohereResponse, query) {
+    const enhancedMainResponse = this.createEnhancedMainResponse(
+      originalResponse.response, 
+      cohereResponse, 
+      query
+    );
+    
+    const knowledgeSection = {
+      title: 'Informações Complementares da Base de Conhecimento',
+      content: cohereResponse,
+      type: 'knowledge_enhancement'
+    };
+    
+    return {
+      ...originalResponse,
+      response: enhancedMainResponse,
+      sections: [...(originalResponse.sections || []), knowledgeSection],
+      confidence: Math.max(originalResponse.confidence, 0.7),
+      enhanced: true,
+      enhancementType: 'cohere_knowledge'
+    };
+  }
+
+  /**
+   * Creates enhanced main response combining web data and AI knowledge
+   */
+  createEnhancedMainResponse(originalResponse, cohereResponse, query) {
+    const hasLimitedWebData = originalResponse.length < MIN_SUMMARY_LENGTH * 2;
+    
+    if (hasLimitedWebData) {
+      return `Baseando-me nas informações disponíveis e conhecimento especializado sobre **${query}**:
+
+${cohereResponse}
+
+**Informações das fontes web:**
+${originalResponse}`;
+    } else {
+      return `${originalResponse}
+
+**Informações complementares:**
+${cohereResponse}`;
+    }
+  }
+
+  /**
+   * Creates structured sections for the response
+   */
   createStructuredSections(summaries, content, hasSnippets) {
     const sections = [];
     

@@ -1,0 +1,107 @@
+# =====================================================
+# BUSC-AI 2.0 - Docker Compose
+# =====================================================
+# Configuração completa para desenvolvimento e produção
+
+version: '3.8'
+
+services:
+  # Serviço principal do BUSC-AI
+  busc-ai:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: busc-ai-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Configurações básicas
+      - NODE_ENV=production
+      - PORT=3000
+      - LOG_LEVEL=info
+      
+      # IMPORTANTE: Configure suas chaves de API aqui
+      # ou use um arquivo .env (recomendado)
+      - COHERE_API_KEY=${COHERE_API_KEY}
+      - SERPER_API_KEY=${SERPER_API_KEY}
+      
+      # Configurações de performance
+      - API_RATE_LIMIT=20
+      - WEB_REQUEST_RATE_LIMIT=10
+      - CACHE_TTL=172800
+      - CACHE_MAX_SIZE=5000
+      
+      # Timeouts
+      - REQUEST_TIMEOUT=45000
+      - AI_SERVICE_TIMEOUT=90000
+      
+      # Funcionalidades
+      - ENABLE_COHERE_ENHANCEMENT=true
+      - ENABLE_DETAILED_LOGGING=false
+      - ENABLE_CACHE=true
+      - DEBUG_MODE=false
+      - VERBOSE_LOGGING=false
+      
+      # Configurações de IA
+      - AI_MODEL=command-r-plus
+      - AI_MAX_TOKENS=4096
+      - AI_TEMPERATURE=0.2
+      
+      # Configurações de busca
+      - MAX_PAGES_TO_ANALYZE=15
+      - MAX_CONTENT_LENGTH=500000
+      - RETRY_ATTEMPTS=5
+      - RETRY_DELAY=2000
+    
+    volumes:
+      # Persistir logs e cache
+      - ../docker-data/logs:/app/logs
+      - ../docker-data/cache:/app/cache
+      - ../docker-data/temp:/app/temp
+    
+    # Verificação de saúde
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) })"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Configurações de recursos (opcional)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Proxy reverso nginx (opcional)
+  nginx:
+    image: nginx:alpine
+    container_name: busc-ai-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - busc-ai
+    profiles:
+      - nginx
+
+# Volumes nomeados para persistência
+volumes:
+  busc_ai_logs:
+    driver: local
+  busc_ai_cache:
+    driver: local
+
+# Rede personalizada
+networks:
+  busc_ai_network:
+    driver: bridge
